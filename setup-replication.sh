@@ -19,24 +19,6 @@ check_service() {
         sleep 2
         ((attempt++))
     done
-    
-    echo "❌ $service_name failed to become ready after $max_attempts attempts"
-    exit 1
-}
-
-# Function to stop standby and clear old data
-reset_standby() {
-    local standby=$1
-    echo "→ Resetting $standby..."
-    docker compose stop "$standby"
-    docker compose run --rm --entrypoint bash "$standby" -c "rm -rf /var/lib/postgresql/data/*"
-}
-
-# Step 1: Verify primaries are ready
-check_service "worker_citus1"
-check_service "worker_citus2"
-
-# Step 2: Stop and reset standby containers
 reset_standby worker_citus1_standby
 reset_standby worker_citus2_standby
 

@@ -24,6 +24,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "2379:2379"      # etcd client
+      - "2380:2380"      # etcd peer
 
   postgres:
     image: postgres:16.1
@@ -46,6 +49,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "5437:5432"      # Standalone Postgres
 
   coordinator_citus:
     image: citusdata/citus:12.1
@@ -72,6 +77,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "5432:5432"      # PostgreSQL
 
   worker_citus1:
     image: citusdata/citus:12.1
@@ -100,6 +107,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "5433:5432"      # PostgreSQL (worker 1)
 
   worker_citus1_standby:
     image: citusdata/citus:12.1
@@ -148,6 +157,8 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
+    ports:
+      - "5435:5432"      # Standby (worker 1)
 
   worker_citus2:
     image: citusdata/citus:12.1
@@ -176,6 +187,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    ports:
+      - "5434:5432"      # PostgreSQL (worker 2)
 
   worker_citus2_standby:
     image: citusdata/citus:12.1
@@ -224,12 +237,14 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
+    ports:
+      - "5436:5432"      # Standby (worker 2)
 
   pgbouncer:
     image: edoburu/pgbouncer
     container_name: pgbouncer
     ports:
-      - "6432:6432"
+      - "6432:6432"      # PgBouncer
     environment:
       DB_USER: postgres
       DB_PASSWORD_FILE: /run/secrets/db_password
@@ -245,6 +260,153 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"      # Zookeeper client
+      - "2888:2888"      # Zookeeper follower
+      - "3888:3888"      # Zookeeper election
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: echo srvr | nc zookeeper 2181 || exit 1
+      start_period: 10s
+      retries: 20
+      interval: 10s
+    networks:
+      - project_notion
+
+  broker:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: broker
+    container_name: broker
+    ports:
+      - "29092:29092"
+      - "9092:9092"      # Kafka broker
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+    healthcheck:
+      test: nc -z localhost 9092 || exit -1
+      start_period: 15s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    networks:
+      - project_notion
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.4.0
+    hostname: control-center
+    container_name: control-center
+    depends_on:
+      broker:
+        condition: service_healthy
+    ports:
+      - "9021:9021"
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      CONFLUENT_METRICS_ENABLE: 'false'
+      PORT: 9021
+    networks:
+      - project_notion
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9021/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  debezium:
+    image: debezium/connect:2.5
+    container_name: debezium
+    hostname: debezium
+    depends_on:
+      coordinator_citus:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+    ports:
+      - "8083:8083"      # Debezium REST API
+    environment:
+      BOOTSTRAP_SERVERS: broker:29092
+      CONNECT_REST_ADVERTISED_HOST_NAME: debezium
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      STATUS_STORAGE_TOPIC: connect_statuses
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      ENABLE_DEBEZIUM_SCRIPTING: 'true'
+      CONNECT_REST_HOST_NAME: debezium
+      CONNECT_REST_PORT: 8083
+    healthcheck:
+      test:
+        [ 'CMD', 'curl', '--silent', '--fail', '-X', 'GET', 'http://localhost:8083/connectors', ]
+      start_period: 30s
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - project_notion
+    restart: unless-stopped
+
+  debezium-ui:
+    image: debezium/debezium-ui:2.4
+    container_name: debezium-ui
+    hostname: debezium-ui
+    depends_on:
+      debezium:
+        condition: service_healthy
+    ports:
+      - "8081:8080"      # Debezium UI (host:container)
+    environment:
+      KAFKA_CONNECT_URIS: http://debezium:8083
+    networks:
+      - project_notion
+    restart: unless-stopped
+  
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin_simple
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5555:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      coordinator_citus:
+        condition: service_healthy
+    networks:
+      - project_notion
+
+ 
+
+
 networks:
   project_notion:
     driver: bridge
@@ -257,6 +419,8 @@ volumes:
   worker_data2:
   worker_citus1_standby_data:
   worker_citus2_standby_data:
+  pgadmin_data:
+
 
 secrets:
   db_password:
