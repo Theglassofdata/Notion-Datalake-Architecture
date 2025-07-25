@@ -1,0 +1,16 @@
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'debezium'
+    static_configs:
+      - targets: ['debezium:8083'] # Debezium exposes a /metrics endpoint
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['broker:9092'] # Requires a JMX exporter setup in Kafka
+
+  - job_name: 'citus'
+    static_configs:
+      - targets: ['citus-coordinator:9187'] # Requires a Postgres exporter
